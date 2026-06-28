@@ -8,9 +8,7 @@ Gestures:
   Point (index up)          → Move mouse cursor
   Pinch (thumb + index)     → Left click
   Peace (index + middle up) → Right click
-  Fist (all curled)         → Click & hold / drag
   Open Palm (all up)        → Scroll mode (tilt to scroll)
-  Three fingers up          → Middle click / paste (Ctrl+V)
 
 Press Q in the overlay window to quit.
 Press Space to toggle gesture control on/off (pause mode).
@@ -18,7 +16,6 @@ Press C to toggle the camera on/off.
 """
 
 import cv2
-import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python.vision import (
     HandLandmarker,
@@ -44,8 +41,7 @@ FLIP_HORIZONTAL = True       # Mirror the camera so it feels natural
 SMOOTHING       = 7          # Rolling average frames for mouse smoothing (higher = smoother)
 MOVE_SPEED      = 1.2        # Mouse movement speed multiplier
 CLICK_HOLD_MS   = 120        # Min milliseconds between repeated clicks
-PINCH_THRESHOLD = 0.045      # Distance (normalized) to trigger pinch
-FIST_THRESHOLD  = 0.06       # Distance for fist detection
+PINCH_THRESHOLD = 0.045      # Normalized distance to trigger pinch
 
 # Glowing skeleton colors (BGR)
 COLOR_BONE      = (0, 200, 255)   # Cyan-ish
@@ -55,7 +51,7 @@ COLOR_TIP       = (0, 255, 120)   # Green tips
 HUD_COLOR       = (0, 255, 255)   # Yellow HUD text
 HUD_BG          = (20, 20, 40)    # Dark HUD background
 
-# Hand landmark connections (replaces removed mp.solutions.hands.HAND_CONNECTIONS)
+# Hand landmark connections
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
     (0, 5), (5, 6), (6, 7), (7, 8),
@@ -66,11 +62,6 @@ HAND_CONNECTIONS = [
 ]
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-
-def dist(a, b):
-    """Euclidean distance between two landmarks (normalized coords)."""
-    return math.hypot(a.x - b.x, a.y - b.y)
-
 
 def landmark_px(lm, w, h):
     """Convert normalized landmark to pixel coords."""
@@ -99,12 +90,13 @@ def fingers_up(lms):
     return up
 
 
+def pinch_dist(lms):
+    return math.hypot(lms[4].x - lms[8].x, lms[4].y - lms[8].y)
+
+
 def classify_gesture(lms):
     up = fingers_up(lms)
     n_up = sum(up)
-
-    if n_up == 0 or (n_up == 1 and up[0]):
-        return "FIST"
 
     if n_up >= 4:
         return "PALM"
@@ -115,12 +107,15 @@ def classify_gesture(lms):
     if up[1] and not up[2] and not up[3] and not up[4]:
         return "POINT"
 
+    if pinch_dist(lms) < PINCH_THRESHOLD:
+        return "PINCH"
+
     return "IDLE"
 
 
 # ── Glowing draw functions ─────────────────────────────────────────────────────
 
-def draw_glowing_skeleton(frame, lms_px, gesture):
+def draw_glowing_skeleton(frame, lms_px):
     """Draw a neon-glowing hand skeleton on the frame."""
     overlay = frame.copy()
 
@@ -152,68 +147,51 @@ def draw_hud(frame, gesture, active, camera_on, fps, screen_pos):
     """Draw the Windows-style HUD overlay."""
     h, w = frame.shape[:2]
 
-    # HUD panel
-    panel_x, panel_y = 10, 10
-    panel_w, panel_h = 320, 190
-    panel = frame[panel_y:panel_y+panel_h, panel_x:panel_x+panel_w].copy()
-    dark = np.full_like(panel, HUD_BG)
-    cv2.addWeighted(dark, 0.75, panel, 0.25, 0, panel)
-    frame[panel_y:panel_y+panel_h, panel_x:panel_x+panel_w] = panel
+    def draw_panel(px, py, pw, ph, title, lines):
+        panel = frame[py:py+ph, px:px+pw].copy()
+        dark = np.full_like(panel, HUD_BG)
+        cv2.addWeighted(dark, 0.75, panel, 0.25, 0, panel)
+        frame[py:py+ph, px:px+pw] = panel
+        cv2.rectangle(frame, (px, py), (px+pw, py+ph), HUD_COLOR, 1)
+        cv2.rectangle(frame, (px, py), (px+pw, py+22), (40, 40, 80), -1)
+        cv2.putText(frame, f"  {title}", (px+4, py+16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, HUD_COLOR, 1)
+        for i, (text, color) in enumerate(lines):
+            cv2.putText(frame, text, (px+10, py+28+i*18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-    # Border
-    cv2.rectangle(frame,
-                  (panel_x, panel_y),
-                  (panel_x+panel_w, panel_y+panel_h),
-                  HUD_COLOR, 1)
-
-    # Title bar strip
-    cv2.rectangle(frame,
-                  (panel_x, panel_y),
-                  (panel_x+panel_w, panel_y+22),
-                  (40, 40, 80), -1)
-    cv2.putText(frame, "  VR HAND CONTROL",
-                (panel_x+4, panel_y+16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, HUD_COLOR, 1)
-
-    # Status
+    # Left panel — status
+    g_colors = {
+        "PEACE" : (0, 180, 255), "PINCH" : (0, 200, 255),
+        "PALM"  : (0, 255, 180), "POINT" : (0, 255, 255), "IDLE" : (120, 120, 120),
+    }
+    g_color = g_colors.get(gesture, HUD_COLOR)
     cam_label = "CAM ON" if camera_on else "CAM OFF"
     cam_color = (0, 255, 200) if camera_on else (0, 80, 255)
     ctrl_label = "ACTIVE" if active else "PAUSED"
     ctrl_color = (0, 255, 80) if active else (0, 80, 255)
-    cv2.putText(frame, f"CAMERA  : {cam_label}",
-                (panel_x+10, panel_y+44),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, cam_color, 1)
-    cv2.putText(frame, f"CONTROL : {ctrl_label}",
-                (panel_x+10, panel_y+68),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, ctrl_color, 1)
 
-    # Gesture
-    g_colors = {
-        "PEACE" : (0, 180, 255),
-        "FIST"  : (0, 80, 255),
-        "PALM"  : (0, 255, 180),
-        "POINT" : (0, 255, 255),
-        "IDLE"  : (120, 120, 120),
-    }
-    g_color = g_colors.get(gesture, HUD_COLOR)
-    cv2.putText(frame, f"GESTURE: {gesture}",
-                (panel_x+10, panel_y+92),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, g_color, 1)
+    draw_panel(10, 10, 300, 190, "VR HAND CONTROL", [
+        (f"CAMERA  : {cam_label}", cam_color),
+        (f"CONTROL : {ctrl_label}", ctrl_color),
+        (f"GESTURE : {gesture}", g_color),
+        (f"CURSOR  : {screen_pos[0]}, {screen_pos[1]}", HUD_COLOR),
+        (f"FPS     : {fps:.0f}", HUD_COLOR),
+        ("[C]=Camera  [Space]=Pause  [Q]=Quit", (160, 160, 200)),
+    ])
 
-    # Cursor position
-    cv2.putText(frame, f"CURSOR : {screen_pos[0]}, {screen_pos[1]}",
-                (panel_x+10, panel_y+116),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, HUD_COLOR, 1)
-
-    # FPS
-    cv2.putText(frame, f"FPS    : {fps:.0f}",
-                (panel_x+10, panel_y+140),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, HUD_COLOR, 1)
-
-    # Controls hint
-    cv2.putText(frame, "  [C]=Camera  [Space]=Pause  [Q]=Quit",
-                (panel_x+4, panel_y+164),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (160, 160, 200), 1)
+    # Bottom panel — gesture instructions
+    inst_lines = [
+        ("POINT: index up           -> Move cursor",    (0, 255, 255)),
+        ("PINCH: thumb+index close  -> Left click",     (0, 200, 255)),
+        ("PEACE: index+middle up    -> Right click",    (0, 180, 255)),
+        ("PALM:  all open           -> Scroll",         (0, 255, 180)),
+    ]
+    iw = w - 20
+    ih = 22 + len(inst_lines) * 18 + 6
+    ix = 10
+    iy = h - ih - 10
+    draw_panel(ix, iy, iw, ih, "GESTURES", inst_lines)
 
 
 # ── Gesture action handler ─────────────────────────────────────────────────────
@@ -269,6 +247,14 @@ class GestureController:
                 pyautogui.mouseUp()
                 self.dragging = False
 
+        elif gesture == "PINCH":
+            self.smooth_move(tx, ty)
+            if self.can_click():
+                pyautogui.click()
+            if self.dragging:
+                pyautogui.mouseUp()
+                self.dragging = False
+
         elif gesture == "PEACE":
             self.smooth_move(tx, ty)
             if self.prev_gesture != "PEACE":
@@ -279,14 +265,6 @@ class GestureController:
                 if not self.dragging:
                     pyautogui.mouseDown()
                     self.dragging = True
-
-        elif gesture == "FIST":
-            self.smooth_move(tx, ty)
-            if self.prev_gesture != "FIST" and self.can_click():
-                pyautogui.rightClick()
-            if self.dragging:
-                pyautogui.mouseUp()
-                self.dragging = False
 
         elif gesture == "PALM":
             wrist_y = lms[0].y
@@ -396,7 +374,7 @@ def main():
                 for lms in result.hand_landmarks:
                     lms_px = [landmark_px(lm, w, h) for lm in lms]
 
-                    draw_glowing_skeleton(frame, lms_px, gesture)
+                    draw_glowing_skeleton(frame, lms_px)
                     gesture = classify_gesture(lms)
 
                     if active:
