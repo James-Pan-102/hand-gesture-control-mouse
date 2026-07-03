@@ -5,10 +5,9 @@ Controls your mouse and keyboard using hand gestures detected from your webcam.
 Displays a glowing skeleton overlay in a floating window.
 
 Gestures:
-  Point (index up)          → Move mouse cursor
-  Pinch (thumb + index)     → Left click
-  Peace (index + middle up) → Right click
-  Open Palm (all up)        → Scroll mode (tilt to scroll)
+  Fist (all fingers closed)        → Move mouse cursor
+  OK sign (thumb-index circle)     → Click (right hand = left click, left hand = right click)
+  Open Palm (all up, swipe)        → Scroll (swipe up/down)
 
 Press Q in the overlay window to quit.
 Press Space to toggle gesture control on/off (pause mode).
@@ -41,7 +40,13 @@ FLIP_HORIZONTAL = True       # Mirror the camera so it feels natural
 SMOOTHING       = 7          # Rolling average frames for mouse smoothing (higher = smoother)
 MOVE_SPEED      = 1.2        # Mouse movement speed multiplier
 CLICK_HOLD_MS   = 120        # Min milliseconds between repeated clicks
-PINCH_THRESHOLD = 0.045      # Normalized distance to trigger pinch
+
+OK_THRESHOLD    = 0.05       # Normalized distance for thumb-index circle (OK sign)
+SCROLL_SPEED    = 40         # Scroll speed multiplier (delta from origin → scroll amount)
+
+# Gesture-to-click mapping — change these to swap which hand does which click
+RIGHT_HAND_OK_ACTION = "left_click"   # "left_click" or "right_click"
+LEFT_HAND_OK_ACTION  = "right_click"  # "left_click" or "right_click"
 
 # Glowing skeleton colors (BGR)
 COLOR_BONE      = (0, 200, 255)   # Cyan-ish
@@ -90,25 +95,21 @@ def fingers_up(lms):
     return up
 
 
-def pinch_dist(lms):
-    return math.hypot(lms[4].x - lms[8].x, lms[4].y - lms[8].y)
-
-
 def classify_gesture(lms):
     up = fingers_up(lms)
-    n_up = sum(up)
 
-    if n_up >= 4:
+    # FIST: index, middle, ring, pinky all closed
+    if not up[1] and not up[2] and not up[3] and not up[4]:
+        return "FIST"
+
+    # OK: thumb-index touching + at least 2 of middle/ring/pinky extended
+    ok_dist = math.hypot(lms[4].x - lms[8].x, lms[4].y - lms[8].y)
+    if ok_dist < OK_THRESHOLD and sum(up[2:]) >= 2:
+        return "OK"
+
+    # PALM: 4+ fingers up (open hand for swipe)
+    if sum(up) >= 4:
         return "PALM"
-
-    if up[1] and up[2] and not up[3] and not up[4]:
-        return "PEACE"
-
-    if up[1] and not up[2] and not up[3] and not up[4]:
-        return "POINT"
-
-    if pinch_dist(lms) < PINCH_THRESHOLD:
-        return "PINCH"
 
     return "IDLE"
 
@@ -162,10 +163,12 @@ def draw_hud(frame, gesture, active, camera_on, fps, screen_pos):
 
     # Left panel — status
     g_colors = {
-        "PEACE" : (0, 180, 255), "PINCH" : (0, 200, 255),
-        "PALM"  : (0, 255, 180), "POINT" : (0, 255, 255), "IDLE" : (120, 120, 120),
+        "FIST" : (0, 255, 255), "OK" : (0, 200, 255),
+        "PALM" : (0, 255, 180), "IDLE" : (120, 120, 120),
     }
-    g_color = g_colors.get(gesture, HUD_COLOR)
+    first_gesture = gesture.split()[0] if gesture else "IDLE"
+    first_gesture = first_gesture.split(":")[-1] if ":" in first_gesture else first_gesture
+    g_color = g_colors.get(first_gesture, HUD_COLOR)
     cam_label = "CAM ON" if camera_on else "CAM OFF"
     cam_color = (0, 255, 200) if camera_on else (0, 80, 255)
     ctrl_label = "ACTIVE" if active else "PAUSED"
@@ -181,11 +184,13 @@ def draw_hud(frame, gesture, active, camera_on, fps, screen_pos):
     ])
 
     # Bottom panel — gesture instructions
+    r_act = "Left" if RIGHT_HAND_OK_ACTION == "left_click" else "Right"
+    l_act = "Right" if LEFT_HAND_OK_ACTION == "right_click" else "Left"
     inst_lines = [
-        ("POINT: index up           -> Move cursor",    (0, 255, 255)),
-        ("PINCH: thumb+index close  -> Left click",     (0, 200, 255)),
-        ("PEACE: index+middle up    -> Right click",    (0, 180, 255)),
-        ("PALM:  all open           -> Scroll",         (0, 255, 180)),
+        ("FIST: all closed          -> Move cursor",      (0, 255, 255)),
+        (f"OK R-hand: circle         -> {r_act} click",     (0, 200, 255)),
+        (f"OK L-hand: circle         -> {l_act} click",     (0, 180, 255)),
+        ("PALM: all open + swipe     -> Scroll",           (0, 255, 180)),
     ]
     iw = w - 20
     ih = 22 + len(inst_lines) * 18 + 6
@@ -211,7 +216,6 @@ class GestureController:
         """Map a landmark's position to screen coordinates with margins."""
         margin_x = 0.10
         margin_y = 0.10
-        # Clamp and remap [margin, 1-margin] → [0, screen]
         nx = np.clip((lm.x - margin_x) / (1 - 2 * margin_x), 0, 1)
         ny = np.clip((lm.y - margin_y) / (1 - 2 * margin_y), 0, 1)
         return int(nx * self.sw), int(ny * self.sh)
@@ -222,7 +226,6 @@ class GestureController:
         sx = int(np.mean(self.smooth_x))
         sy = int(np.mean(self.smooth_y))
         cx, cy = pyautogui.position()
-        # Ease toward target
         nx = int(cx + (sx - cx) * MOVE_SPEED)
         ny = int(cy + (sy - cy) * MOVE_SPEED)
         pyautogui.moveTo(nx, ny)
@@ -235,42 +238,42 @@ class GestureController:
             return True
         return False
 
-    def handle(self, gesture, lms, frame_w, frame_h):
-        index_tip = lms[8]
-        tx, ty    = self.map_to_screen(index_tip, frame_w, frame_h)
-        cur_pos   = pyautogui.position()
-        now_ms    = time.time() * 1000
+    def handle(self, gesture, lms, frame_w, frame_h, handedness="Unknown"):
+        cur_pos = pyautogui.position()
 
-        if gesture == "POINT":
+        if gesture == "FIST":
+            index_tip = lms[8]
+            tx, ty = self.map_to_screen(index_tip, frame_w, frame_h)
             self.smooth_move(tx, ty)
+            cur_pos = (tx, ty)
+            self.scroll_origin = None
             if self.dragging:
                 pyautogui.mouseUp()
                 self.dragging = False
 
-        elif gesture == "PINCH":
-            self.smooth_move(tx, ty)
+        elif gesture == "OK":
+            self.scroll_origin = None
+            if self.dragging:
+                pyautogui.mouseUp()
+                self.dragging = False
+
             if self.can_click():
-                pyautogui.click()
-            if self.dragging:
-                pyautogui.mouseUp()
-                self.dragging = False
-
-        elif gesture == "PEACE":
-            self.smooth_move(tx, ty)
-            if self.prev_gesture != "PEACE":
-                self.gesture_start = now_ms
-                if self.can_click():
-                    pyautogui.click()
-            elif now_ms - self.gesture_start > HOLD_MS:
-                if not self.dragging:
-                    pyautogui.mouseDown()
-                    self.dragging = True
+                if handedness == "Right":
+                    if RIGHT_HAND_OK_ACTION == "left_click":
+                        pyautogui.click(button='left')
+                    else:
+                        pyautogui.click(button='right')
+                elif handedness == "Left":
+                    if LEFT_HAND_OK_ACTION == "right_click":
+                        pyautogui.click(button='right')
+                    else:
+                        pyautogui.click(button='left')
 
         elif gesture == "PALM":
             wrist_y = lms[0].y
             if self.scroll_origin is None:
                 self.scroll_origin = wrist_y
-            delta = (self.scroll_origin - wrist_y) * 30
+            delta = (self.scroll_origin - wrist_y) * SCROLL_SPEED
             if abs(delta) > 0.5:
                 pyautogui.scroll(int(delta))
             if self.dragging:
@@ -282,9 +285,6 @@ class GestureController:
             if self.dragging:
                 pyautogui.mouseUp()
                 self.dragging = False
-
-        if gesture != "PALM":
-            self.scroll_origin = None
 
         self.prev_gesture = gesture
         return cur_pos
@@ -332,7 +332,7 @@ def main():
         HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path="hand_landmarker.task"),
             running_mode=RunningMode.IMAGE,
-            num_hands=1,
+            num_hands=2,
             min_hand_detection_confidence=0.7,
             min_hand_presence_confidence=0.7,
             min_tracking_confidence=0.6,
@@ -371,14 +371,21 @@ def main():
             result = hand_landmarker.detect(mp_img)
 
             if result.hand_landmarks:
-                for lms in result.hand_landmarks:
+                gesture_parts = []
+                for i, lms in enumerate(result.hand_landmarks):
                     lms_px = [landmark_px(lm, w, h) for lm in lms]
-
                     draw_glowing_skeleton(frame, lms_px)
-                    gesture = classify_gesture(lms)
+                    g = classify_gesture(lms)
+
+                    hand_name = "?"
+                    if result.handedness and i < len(result.handedness):
+                        hand_name = result.handedness[i][0].category_name[0]
+                    gesture_parts.append(f"{hand_name}:{g}")
 
                     if active:
-                        cur_pos = controller.handle(gesture, lms, w, h)
+                        handedness = result.handedness[i][0].category_name if result.handedness else "Unknown"
+                        cur_pos = controller.handle(g, lms, w, h, handedness)
+                gesture = " ".join(gesture_parts)
             else:
                 gesture = "IDLE"
                 if controller.dragging:
